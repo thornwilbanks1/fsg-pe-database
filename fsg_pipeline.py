@@ -34,7 +34,7 @@ from rapidfuzz import fuzz
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 API_KEY      = os.getenv("ANTHROPIC_API_KEY", "")   # or paste key here
 MODEL        = "claude-sonnet-4-20250514"
-DB_FILE      = "2026_04_24_CLAUDE_DATABASE_PRIVATE_EQUITY_RESEARCH_v3.xlsx"
+DB_FILE      = "2026_04_24_CLAUDE_DATABASE_PRIVATE_EQUITY_RESEARCH_v8.xlsx"
 FIRMS_CSV    = "firms_to_research.csv"
 OUTPUT_DB    = "STEPHENS_FSG_DATABASE.xlsx"
 LOG_CSV      = "pipeline_log.csv"
@@ -43,6 +43,9 @@ ERROR_LOG    = "pipeline_errors.log"
 DELAY_BETWEEN_FIRMS = 2     # seconds between firms (be polite)
 MAX_HTML_CHARS      = 14000  # truncation before sending to API
 FUZZY_DUPE_THRESH   = 88    # rapidfuzz score to flag near-duplicates
+SKIP_IF_FIRM_HAS_ROWS = True  # resume support: skip firms already in the DB
+MAX_RETRIES         = 3     # retries for fetch + API calls on transient errors
+RETRY_BACKOFF_BASE  = 4     # seconds; doubles each retry (4, 8, 16)
 
 # ── LOGGING ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -128,7 +131,7 @@ Return ONLY a JSON object with these keys (use "" for anything not found):
 # ── HELPERS ────────────────────────────────────────────────────────────────────
 
 def fetch_page(url: str) -> str | None:
-    """Fetch a URL; return clean text or None."""
+    """Fetch a URL with retry/backoff; return clean text or None."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -136,12 +139,22 @@ def fetch_page(url: str) -> str | None:
         ),
         "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
     }
-    try:
-        r = httpx.get(url, headers=headers, timeout=20, follow_redirects=True)
-        if r.status_code == 200 and len(r.text) > 2000:
-            return r.text
-    except Exception:
-        pass
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = httpx.get(url, headers=headers, timeout=20, follow_redirects=True)
+            if r.status_code == 200 and len(r.text) > 2000:
+                return r.text
+            # 4xx (other than 429) → don't retry
+            if 400 <= r.status_code < 500 and r.status_code != 429:
+                return None
+            last_err = f"HTTP {r.status_code}"
+        except Exception as e:
+            last_err = str(e)
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
+    if last_err:
+        logging.warning(f"fetch_page failed after {MAX_RETRIES} attempts: {url} — {last_err}")
     return None
 
 
@@ -174,13 +187,22 @@ def find_portfolio_url(base_url: str, given_suffix: str = "") -> str | None:
 
 
 def call_claude(prompt: str, client: anthropic.Anthropic) -> str:
-    """Single Claude API call; return text content."""
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.content[0].text.strip()
+    """Single Claude API call with retry/backoff; return text content."""
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=4096,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return response.content[0].text.strip()
+        except (anthropic.APIConnectionError, anthropic.APITimeoutError,
+                anthropic.RateLimitError, anthropic.InternalServerError) as e:
+            last_err = e
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
+    raise last_err if last_err else RuntimeError("call_claude failed")
 
 
 def parse_json(text: str) -> list | dict | None:
@@ -330,6 +352,11 @@ def load_existing(ws) -> set:
         if f and c:
             existing.add((f, c))
     return existing
+
+
+def firms_already_in_db(existing: set) -> set:
+    """Return set of firm names (lowercased) that already have ≥1 row."""
+    return {firm for (firm, _company) in existing}
 
 
 def write_row(ws, row: dict, existing: set):
@@ -484,6 +511,7 @@ def main():
     wb = load_workbook(OUTPUT_DB)
     ws = wb["Investments"]
     existing = load_existing(ws)
+    done_firms = firms_already_in_db(existing) if SKIP_IF_FIRM_HAS_ROWS else set()
 
     client = anthropic.Anthropic(api_key=API_KEY)
 
@@ -492,6 +520,7 @@ def main():
     print(f"{'='*60}")
     print(f"  Firms to process: {len(firms)}")
     print(f"  Existing rows:    {len(existing)}")
+    print(f"  Firms already in DB (will skip): {len(done_firms)}")
     print(f"  Model:            {MODEL}")
     print(f"  Output:           {OUTPUT_DB}")
     print(f"{'='*60}")
@@ -499,9 +528,23 @@ def main():
     # ── Process firms ──────────────────────────────────────────────────────────
     log_rows = []
     total_written = 0
+    skipped_count = 0
 
     for i, firm in enumerate(firms, 1):
         print(f"\n[{i}/{len(firms)}]", end="")
+        if SKIP_IF_FIRM_HAS_ROWS and firm["firm_name"].strip().lower() in done_firms:
+            skipped_count += 1
+            print(f"  ⏭  {firm['firm_name']} — already in DB, skipping")
+            log_rows.append({
+                "firm": firm["firm_name"],
+                "status": "skipped",
+                "portcos_found": 0,
+                "portcos_written": 0,
+                "portcos_failed": 0,
+                "hard_failures": "Already in DB (resume skip)",
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+            continue
         try:
             result = process_firm(
                 firm["firm_name"], firm["website"], firm["suffix"],
@@ -541,6 +584,7 @@ def main():
     success = sum(1 for r in log_rows if r["status"] == "success")
     partial = sum(1 for r in log_rows if r["status"] == "partial")
     failed  = sum(1 for r in log_rows if r["status"] in ("fail","error"))
+    skipped = sum(1 for r in log_rows if r["status"] == "skipped")
 
     print(f"\n{'='*60}")
     print(f"  PIPELINE COMPLETE")
@@ -549,6 +593,7 @@ def main():
     print(f"  Success:        {success}")
     print(f"  Partial:        {partial}")
     print(f"  Failed:         {failed}")
+    print(f"  Skipped (done): {skipped}")
     print(f"  Portcos added:  {total_written}")
     print(f"  DB total rows:  {ws.max_row - 1}")
     print(f"\n  Output files:")

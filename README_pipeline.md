@@ -27,7 +27,7 @@ $env:ANTHROPIC_API_KEY = "sk-ant-api03-..."
 **4. Place these files in one folder:**
 - `fsg_pipeline.py`          — this script
 - `firms_to_research.csv`    — your firm list
-- `2026_04_24_CLAUDE_DATABASE_PRIVATE_EQUITY_RESEARCH_v3.xlsx` — your database
+- `2026_04_24_CLAUDE_DATABASE_PRIVATE_EQUITY_RESEARCH_v8.xlsx` — your database
 
 ---
 
@@ -41,7 +41,20 @@ Pfingsten Partners,https://pfingsten.com,
 ```
 
 - `portfolio_url_suffix` is optional — script auto-detects if blank
-- To run all 472 firms: export from your database's Private Equity Firms tab
+- The shipped `firms_to_research.csv` already contains all 483 firms from the v8 master "Private Equity Firms" sheet
+
+## Resume / restart
+
+The script saves after every firm and supports firm-level resume out of the box:
+- On startup it scans `STEPHENS_FSG_DATABASE.xlsx` and skips any firm that already has ≥1 row
+- If you `Ctrl-C` and re-run `python3 fsg_pipeline.py`, it picks up where it left off
+- To force a re-run for one firm, delete its rows from the output workbook first
+- Toggle off via `SKIP_IF_FIRM_HAS_ROWS = False` at the top of the script
+
+## Retries
+
+`fetch_page` and `call_claude` retry transient errors up to 3 times with
+exponential backoff (4s, 8s, 16s). Tune via `MAX_RETRIES` / `RETRY_BACKOFF_BASE`.
 
 ---
 
@@ -99,7 +112,7 @@ Just run it again — it picks up where it left off.
 ```python
 API_KEY      = ""              # Or use env var (recommended)
 MODEL        = "claude-sonnet-4-20250514"
-DB_FILE      = "2026_04_24_CLAUDE_DATABASE_PRIVATE_EQUITY_RESEARCH_v3.xlsx"
+DB_FILE      = "2026_04_24_CLAUDE_DATABASE_PRIVATE_EQUITY_RESEARCH_v8.xlsx"
 FIRMS_CSV    = "firms_to_research.csv"
 OUTPUT_DB    = "STEPHENS_FSG_DATABASE.xlsx"
 DELAY_BETWEEN_FIRMS = 2        # seconds — increase if getting rate-limited
