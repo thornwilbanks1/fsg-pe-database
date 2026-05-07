@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Pipeline runtime artifacts
+pipeline_errors.log
+pipeline_log.csv
+STEPHENS_FSG_DATABASE.xlsx
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
