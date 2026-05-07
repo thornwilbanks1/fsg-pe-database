@@ -6,9 +6,11 @@ data directly to your Excel database. Runs fully unattended — no "continue"
 prompts, no response length limits, no session timeouts.
 
 SETUP (one time):
-    pip install anthropic httpx beautifulsoup4 lxml openpyxl rapidfuzz
+    pip install anthropic firecrawl-py openpyxl rapidfuzz
 
 USAGE:
+    export ANTHROPIC_API_KEY=sk-ant-...
+    export FIRECRAWL_API_KEY=fc-...
     python3 fsg_pipeline.py
 
 CONFIGURATION:
@@ -24,15 +26,15 @@ import os, csv, json, re, time, logging
 from datetime import datetime
 from pathlib import Path
 
-import httpx
 import anthropic
-from bs4 import BeautifulSoup
+from firecrawl import Firecrawl
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from rapidfuzz import fuzz
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-API_KEY      = os.getenv("ANTHROPIC_API_KEY", "")   # or paste key here
+API_KEY           = os.getenv("ANTHROPIC_API_KEY", "")   # or paste key here
+FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "")   # or paste key here
 MODEL        = "claude-sonnet-4-20250514"
 DB_FILE      = "2026_04_24_CLAUDE_DATABASE_PRIVATE_EQUITY_RESEARCH_v3.xlsx"
 FIRMS_CSV    = "firms_to_research.csv"
@@ -40,9 +42,10 @@ OUTPUT_DB    = "STEPHENS_FSG_DATABASE.xlsx"
 LOG_CSV      = "pipeline_log.csv"
 ERROR_LOG    = "pipeline_errors.log"
 
-DELAY_BETWEEN_FIRMS = 2     # seconds between firms (be polite)
-MAX_HTML_CHARS      = 14000  # truncation before sending to API
-FUZZY_DUPE_THRESH   = 88    # rapidfuzz score to flag near-duplicates
+DELAY_BETWEEN_FIRMS = 2      # seconds between firms (be polite)
+MAX_MD_CHARS        = 30000  # markdown truncation before sending to API
+FUZZY_DUPE_THRESH   = 88     # rapidfuzz score to flag near-duplicates
+FIRECRAWL_CACHE_MS  = 7 * 24 * 60 * 60 * 1000  # 7-day cache for scrape calls
 
 # ── LOGGING ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -53,7 +56,8 @@ logging.basicConfig(
 
 # ── EXTRACTION PROMPT ──────────────────────────────────────────────────────────
 PORTFOLIO_PROMPT = """\
-You are a private equity analyst. Extract ALL portfolio companies from the HTML below.
+You are a private equity analyst. Extract ALL portfolio companies from the page
+content below (rendered as markdown by Firecrawl).
 
 Return ONLY a raw JSON array. No markdown, no preamble.
 
@@ -89,8 +93,8 @@ Rules:
 - Do NOT invent data — use "" for unknown fields
 - Return [] if no companies found
 
-HTML:
-{html}
+PAGE CONTENT (markdown):
+{content}
 """
 
 ENRICH_PROMPT = """\
@@ -127,48 +131,72 @@ Return ONLY a JSON object with these keys (use "" for anything not found):
 
 # ── HELPERS ────────────────────────────────────────────────────────────────────
 
-def fetch_page(url: str) -> str | None:
-    """Fetch a URL; return clean text or None."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-    }
+PORTFOLIO_URL_HINTS = (
+    "portfolio", "portfolio-companies", "our-portfolio",
+    "investments", "companies", "our-companies",
+    "portfolio/current", "portfolio/active",
+)
+
+
+def scrape_markdown(url: str, fc: Firecrawl) -> str | None:
+    """
+    Scrape `url` via Firecrawl and return the page content as markdown.
+    Returns None on failure or trivially short content.
+    """
     try:
-        r = httpx.get(url, headers=headers, timeout=20, follow_redirects=True)
-        if r.status_code == 200 and len(r.text) > 2000:
-            return r.text
-    except Exception:
-        pass
+        doc = fc.scrape(
+            url,
+            formats=["markdown"],
+            only_main_content=True,
+            max_age=FIRECRAWL_CACHE_MS,
+        )
+    except Exception as e:
+        logging.warning(f"Firecrawl scrape failed for {url}: {e}")
+        return None
+
+    md = getattr(doc, "markdown", None)
+    if md and len(md) >= 500:
+        return md
     return None
 
 
-def clean_html(raw: str) -> str:
-    """Strip noise, return truncated clean HTML."""
-    soup = BeautifulSoup(raw, "lxml")
-    for tag in soup(["script","style","nav","footer","header","noscript","svg","iframe"]):
-        tag.decompose()
-    return soup.decode()[:MAX_HTML_CHARS]
+def truncate_md(md: str) -> str:
+    """Truncate markdown to MAX_MD_CHARS for the extraction prompt."""
+    return md[:MAX_MD_CHARS]
 
 
-def find_portfolio_url(base_url: str, given_suffix: str = "") -> str | None:
-    """Return the portfolio page URL."""
+def find_portfolio_url(base_url: str, given_suffix: str, fc: Firecrawl) -> str | None:
+    """
+    Locate a firm's portfolio page URL.
+
+    Order of attempts:
+      1. user-supplied suffix from the CSV
+      2. Firecrawl `map` with search='portfolio' (cheap; one API call)
+      3. fixed list of common portfolio paths
+    """
     base = base_url.rstrip("/")
+
     if given_suffix:
         url = base + "/" + given_suffix.lstrip("/")
-        if fetch_page(url):
+        if scrape_markdown(url, fc):
             return url
-    candidates = [
-        "/portfolio", "/portfolio-companies", "/our-portfolio",
-        "/investments", "/companies", "/our-companies",
-        "/portfolio/current", "/portfolio/active",
-    ]
-    for suffix in candidates:
-        url = base + suffix
-        html = fetch_page(url)
-        if html and len(html) > 3000:
+
+    try:
+        mapped = fc.map(base, search="portfolio", limit=20)
+        for link in (getattr(mapped, "links", None) or []):
+            link_url = getattr(link, "url", None) or (link if isinstance(link, str) else None)
+            if not link_url:
+                continue
+            lower = link_url.lower().rstrip("/")
+            if any(lower.endswith("/" + h) or ("/" + h + "/") in lower for h in PORTFOLIO_URL_HINTS):
+                if scrape_markdown(link_url, fc):
+                    return link_url
+    except Exception as e:
+        logging.warning(f"Firecrawl map failed for {base}: {e}")
+
+    for hint in PORTFOLIO_URL_HINTS:
+        url = f"{base}/{hint}"
+        if scrape_markdown(url, fc):
             return url
     return None
 
@@ -193,10 +221,9 @@ def parse_json(text: str) -> list | dict | None:
         return None
 
 
-def extract_portcos(html: str, firm_name: str, client: anthropic.Anthropic) -> list[dict]:
-    """Send cleaned HTML to Claude; return portco list."""
-    clean = clean_html(html)
-    prompt = PORTFOLIO_PROMPT.format(html=clean)
+def extract_portcos(content: str, firm_name: str, client: anthropic.Anthropic) -> list[dict]:
+    """Send page markdown to Claude; return portco list."""
+    prompt = PORTFOLIO_PROMPT.format(content=truncate_md(content))
     raw = call_claude(prompt, client)
     result = parse_json(raw)
     if not isinstance(result, list):
@@ -352,7 +379,8 @@ def write_row(ws, row: dict, existing: set):
 # ── MAIN PIPELINE ──────────────────────────────────────────────────────────────
 
 def process_firm(firm_name: str, website: str, portfolio_suffix: str,
-                 ws, existing: set, client: anthropic.Anthropic) -> dict:
+                 ws, existing: set, client: anthropic.Anthropic,
+                 fc: Firecrawl) -> dict:
     """
     Full pipeline for one firm.
     Returns a result dict for the log.
@@ -371,28 +399,24 @@ def process_firm(firm_name: str, website: str, portfolio_suffix: str,
     print(f"  {firm_name}")
     print(f"{'─'*60}")
 
-    # Stage 1: Find and fetch portfolio page
-    portfolio_url = find_portfolio_url(website, portfolio_suffix)
-    if not portfolio_url:
-        print(f"  ✗ Portfolio page not found — trying homepage")
-        html = fetch_page(website)
-        if not html:
-            result["hard_failures"] = "Portfolio page and homepage both unreachable"
-            print(f"  ✗ Unreachable — skipping")
-            return result
-        portfolio_url = website
+    # Stage 1: Find and scrape portfolio page (Firecrawl → markdown)
+    portfolio_url = find_portfolio_url(website, portfolio_suffix, fc)
+    if portfolio_url:
+        content = scrape_markdown(portfolio_url, fc)
     else:
-        html = fetch_page(portfolio_url)
+        print(f"  ✗ Portfolio page not found — trying homepage")
+        portfolio_url = website
+        content = scrape_markdown(website, fc)
 
-    if not html:
-        result["hard_failures"] = "Fetch failed"
-        print(f"  ✗ Fetch failed")
+    if not content:
+        result["hard_failures"] = "Firecrawl scrape failed (portfolio + homepage)"
+        print(f"  ✗ Scrape failed")
         return result
 
-    print(f"  [1] Fetched: {portfolio_url} ({len(html):,} chars)")
+    print(f"  [1] Scraped: {portfolio_url} ({len(content):,} chars markdown)")
 
     # Stage 2: Extract portcos via Claude API
-    portcos = extract_portcos(html, firm_name, client)
+    portcos = extract_portcos(content, firm_name, client)
     result["portcos_found"] = len(portcos)
     print(f"  [2] Extracted: {len(portcos)} companies")
 
@@ -456,6 +480,13 @@ def main():
         print("  Windows:   $env:ANTHROPIC_API_KEY = 'sk-ant-...'")
         return
 
+    if not FIRECRAWL_API_KEY:
+        print("ERROR: Set FIRECRAWL_API_KEY environment variable")
+        print("  Mac/Linux: export FIRECRAWL_API_KEY=fc-...")
+        print("  Windows:   $env:FIRECRAWL_API_KEY = 'fc-...'")
+        print("  Get a key at https://www.firecrawl.dev/")
+        return
+
     if not Path(DB_FILE).exists():
         print(f"ERROR: Database file '{DB_FILE}' not found in current directory")
         print("Download it from the Claude chat session and place it here.")
@@ -486,6 +517,7 @@ def main():
     existing = load_existing(ws)
 
     client = anthropic.Anthropic(api_key=API_KEY)
+    fc = Firecrawl(api_key=FIRECRAWL_API_KEY)
 
     print(f"\n{'='*60}")
     print(f"  FSG PE DATABASE PIPELINE")
@@ -493,6 +525,7 @@ def main():
     print(f"  Firms to process: {len(firms)}")
     print(f"  Existing rows:    {len(existing)}")
     print(f"  Model:            {MODEL}")
+    print(f"  Scraper:          Firecrawl (markdown, only_main_content)")
     print(f"  Output:           {OUTPUT_DB}")
     print(f"{'='*60}")
 
@@ -505,7 +538,7 @@ def main():
         try:
             result = process_firm(
                 firm["firm_name"], firm["website"], firm["suffix"],
-                ws, existing, client
+                ws, existing, client, fc
             )
             log_rows.append(result)
             total_written += result["portcos_written"]
