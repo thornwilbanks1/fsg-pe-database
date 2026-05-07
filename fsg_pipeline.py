@@ -34,7 +34,7 @@ from rapidfuzz import fuzz
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 API_KEY      = os.getenv("ANTHROPIC_API_KEY", "")   # or paste key here
 MODEL        = "claude-sonnet-4-20250514"
-DB_FILE      = "2026_04_24_CLAUDE_DATABASE_PRIVATE_EQUITY_RESEARCH_v3.xlsx"
+DB_FILE      = "2026_04_24_CLAUDE_DATABASE_PRIVATE_EQUITY_RESEARCH_v8.xlsx"
 FIRMS_CSV    = "firms_to_research.csv"
 OUTPUT_DB    = "STEPHENS_FSG_DATABASE.xlsx"
 LOG_CSV      = "pipeline_log.csv"

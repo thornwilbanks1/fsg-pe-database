@@ -27,7 +27,7 @@ $env:ANTHROPIC_API_KEY = "sk-ant-api03-..."
 **4. Place these files in one folder:**
 - `fsg_pipeline.py`          — this script
 - `firms_to_research.csv`    — your firm list
-- `2026_04_24_CLAUDE_DATABASE_PRIVATE_EQUITY_RESEARCH_v3.xlsx` — your database
+- `2026_04_24_CLAUDE_DATABASE_PRIVATE_EQUITY_RESEARCH_v8.xlsx` — your database
 
 ---
 
@@ -99,7 +99,7 @@ Just run it again — it picks up where it left off.
 ```python
 API_KEY      = ""              # Or use env var (recommended)
 MODEL        = "claude-sonnet-4-20250514"
-DB_FILE      = "2026_04_24_CLAUDE_DATABASE_PRIVATE_EQUITY_RESEARCH_v3.xlsx"
+DB_FILE      = "2026_04_24_CLAUDE_DATABASE_PRIVATE_EQUITY_RESEARCH_v8.xlsx"
 FIRMS_CSV    = "firms_to_research.csv"
 OUTPUT_DB    = "STEPHENS_FSG_DATABASE.xlsx"
 DELAY_BETWEEN_FIRMS = 2        # seconds — increase if getting rate-limited
